@@ -1,0 +1,319 @@
+<!--
+  ~ 普源精电科技股份有限公司 版权所有(2019-2025)
+  -->
+
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+    <meta charset="utf-8">
+    <title></title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            text-align: center;
+        }
+
+        table {
+            border: 0;
+        }
+
+        #screenshot,
+        #screenRecord {
+            background-color: #555555;
+            border: none;
+            color: white;
+            padding: 12px 32px;
+            text-align: center;
+            text-decoration: none;
+            display: inline-block;
+            font-size: 14px;
+            border-radius: 4px;
+        }
+
+        #screenshot {
+            margin-left: 12px;
+        }
+
+        #screenRecord {
+            margin-left: 12px;
+        }
+    </style>
+    <script src="./res/config.js"></script>
+    <script type="text/javascript" src="./res/http-live-player.js">;</script>
+    <script>
+        // 图片原始宽高
+        let originalWidth;
+        let originalHeight;
+
+        // 缩放比例
+        let scale = 1;
+
+        window.onresize = function () {
+            console.log("window.onresize[window.innerWidth:" + window.innerWidth + ", window.innerHeight:"
+                + window.innerHeight + "]");
+            //setPictureSize();
+        };
+
+        // window.onload = function () {
+        //     console.log("window.onload[" + (window.outerWidth - window.innerWidth) + ", " + (window.outerHeight - window.innerHeight))
+        //     setPictureSize();
+        // };
+
+        // 浏览器窗口大小改变、图片横竖切换、图片大小改变时，
+        // 重新设置html页面中pic节点的大小
+        function setPictureSize() {
+            const img = document.getElementById("pic");
+            // 初始化时，图片宽高为0，不进行处理
+            if (img.width === 0 || img.height === 0) {
+                return;
+            }
+
+            console.log("[original width:" + img.width + ",height:" + img.height
+                + "], [window width:" + window.innerWidth + ",height:" + window.innerHeight + "]");
+
+            if (originalWidth > originalHeight) {
+                // 横向的图片
+                img.height = originalHeight * window.innerWidth / originalWidth;
+                img.width = window.innerWidth;
+                // 如果图片高度超过浏览器高度，避免产生浏览器滑动，需要将图片进一步缩放
+                if (img.height > window.innerHeight) {
+                    img.width = originalWidth * window.innerHeight / originalHeight;
+                    img.height = window.innerHeight;
+                }
+            } else {
+                // 竖向的图片
+                img.width = originalWidth * window.innerHeight / originalHeight;
+                img.height = window.innerHeight;
+            }
+            // 计算缩放比例，如果picWidth不为0
+            if (originalWidth) {
+                scale = img.width / originalWidth;
+            }
+
+            console.log("setPictureSize[img.width:" + img.width + ",img.height:"
+                + img.height + ",scale:" + scale + "]");
+        }
+
+
+    </script>
+</head>
+
+<body>
+<canvas src="" id="pic" alt="" />
+</body>
+<script>
+    function sleep(delay) {
+        let endTime = new Date().getTime()+parseInt(delay);
+        while (new Date().getTime() < endTime );
+    }
+    /**
+    * 获取网页输入参数
+    */
+    function getParams(key) {
+        var reg = new RegExp("(^|&)" + key + "=([^&]*)(&|$)");
+        var r = window.location.search.substr(1).match(reg);
+        if (r != null) {
+            return unescape(r[2]);
+        }
+        return null;
+    };
+
+    /**
+    * 缩放参数 用于输入点击事件
+    */
+    let scale_w = 1;
+    let scale_h = 1;
+    let offset_w = 0;
+    let offset_h = 0;
+
+    /**
+    * 建立wsavc解码界面
+    */
+    var displayCanvas = document.getElementById("pic");
+    var wsavc = new WSAvcPlayer(displayCanvas, "webgl", 1, 35);
+
+
+    const dogRstCnt = 20;
+    var dogCnt = dogRstCnt*3;
+    var reconnected = false;
+
+    function feedDog() {
+        dogCnt = dogRstCnt;
+    }
+
+
+
+
+    wsavc.setSocketMessageCallback(function () {
+        reconnected = false;
+        feedDog();
+    });
+
+    /**
+    * 设置wsavc获取图像参数后的回调，设置窗口大小
+    */
+    wsavc.setSizeChangedCallback(function (w, h) {
+        try {
+
+            var width = w;
+            var height = h;
+            let deltaWidth = window.outerWidth - window.innerWidth;
+            let deltaHeight = window.outerHeight - window.innerHeight;
+
+            scale_w = w / 1024;
+            scale_h = h / 600;
+            if (scale_w < scale_h) {
+                offset_h = (height - 600.0 * width / 1024) / 2 ;
+                offset_w = 0;
+                scale_h = scale_w;
+            }
+            else {
+                offset_w = (width - 1024.0 * height / 600) / 2 ;
+                offset_h = 0;
+                scale_w = scale_h;
+            }
+
+
+            window.resizeTo(width + deltaWidth, height + deltaHeight);
+        } catch (e) {
+            console.error(e)
+        }
+
+    }
+    );
+
+    /**
+    * webSocket连接时设置编码参数，编码参数地址栏获取
+    */
+    wsavc.setSocketConnectCallback(function () {
+        var message = { "type": "SET_ENCODER", "size": getParams("size"), "rate": getParams("rate") };
+        this.ws.send(JSON.stringify(message));
+        console.log("Sent " + JSON.stringify(message));
+    }
+    );
+    /**
+     * Input WebSocket Connection
+     */
+    const controlEvent = newWebSocket(controlEventServerUrl);
+
+    /**
+    * webSocket连接断开提示
+    */
+     wsavc.setSocketClosedCallback(function () {
+         //console.log("ScreenShot WebSocket Connection Closed.");
+         //alert("服务器中断或其他设备与服务器建立了新的连接，当前连接断开。\n尝试刷新页面重新建立连接。");
+         sleep(2);
+         if (controlEvent.readyState == WebSocket.OPEN && reconnected == false) {
+            console.log("ws state:" + wsavc.ws.readyState);
+            //wsavc.disconnect();
+            wsavc.connect(screenSharingServerUrl);
+            reconnected = true;
+            feedDog();
+        }
+     }
+     );
+    wsavc.connect(screenSharingServerUrl);
+    window.wsavc = wsavc;
+
+
+
+    /**
+     * Input WebSocket Connection
+     */
+    //const controlEvent = newWebSocket(controlEventServerUrl);
+    // 鼠标事件
+    let isDown;
+    let nowTime;
+    document.getElementById("pic").onmousedown = function (evt) {
+        console.log("onmousedown, evt: " + evt.button)
+        // 响应鼠标左键
+        if (evt.button === 0) {
+            evt.preventDefault();
+            isDown = true;
+            nowTime = Date.now();
+            const e = event || window.event;
+            const img = document.getElementById("pic");
+            if (e.offsetX > offset_w && e.offsetX < img.width - offset_w && e.offsetY > offset_h && e.offsetY < img.height - offset_h) {
+                sendTouchEvent("onmousedown", (e.offsetX - offset_w) / scale_w, (e.offsetY - offset_h) / scale_h);
+            }
+        }
+    };
+    document.getElementById("pic").onmousemove = function (evt) {
+        console.log("onmousemove, evt: " + evt.button)
+        // 响应鼠标左键
+        if (evt.button === 0) {
+            const e = event || window.event;
+            if (isDown) {
+                const img = document.getElementById("pic");
+                if (e.offsetX > offset_w && e.offsetX < img.width - offset_w && e.offsetY > offset_h && e.offsetY < img.height - offset_h) {
+                    sendTouchEvent("onmousemove", (e.offsetX - offset_w) / scale_w, (e.offsetY - offset_h) / scale_h);
+                }
+            }
+        }
+    };
+    document.getElementById("pic").onmouseup = function (evt) {
+        console.log("onmouseup, evt: " + evt.button)
+        // 响应鼠标左键
+        if (evt.button === 0) {
+            isDown = false;
+            const e = event || window.event;
+            const img = document.getElementById("pic");
+            if (e.offsetX > offset_w && e.offsetX < img.width - offset_w && e.offsetY > offset_h && e.offsetY < img.height - offset_h) {
+                sendTouchEvent("onmouseup", (e.offsetX - offset_w) / scale_w, (e.offsetY - offset_h) / scale_h);
+            }
+        }
+    };
+    document.getElementById("pic").onmouseleave = function (evt) {
+        console.log("onmouseleave, evt: " + evt.button + " " + isDown);
+        // 响应鼠标左键
+        const e = event || window.event;
+        if (isDown) {
+            isDown = false;
+            const img = document.getElementById("pic");
+            console.log("" + (e.offsetX - offset_w) / scale_w + "" + (e.offsetY - offset_h) / scale_h);
+            sendTouchEvent("onmouseup", (e.offsetX - offset_w) / scale_w, (e.offsetY - offset_h) / scale_h);
+        }
+    };
+
+    // 发送鼠标消息
+    function sendTouchEvent(eventType, x, y) {
+        const obj = {
+            type: eventType,
+            downDelta: Date.now - nowTime,
+            clientX: x,
+            clientY: y
+        };
+        if (controlEvent.readyState === WebSocket.OPEN) {
+            controlEvent.send(JSON.stringify(obj));
+            console.log("sendTouchEvent[" + eventType + ":" + x / scale + "," + y / scale + "]");
+        }
+    }
+
+
+    /**
+     * 看门狗启动
+     */
+    function onDog() {
+        dogCnt--;
+        console.log("dog cnt:" + dogCnt);
+        if (dogCnt <= 0) //2s timeout to reconnect
+        {
+            if (reconnected == false) {
+                console.log("ws state:" + wsavc.ws.readyState);
+                wsavc.disconnect();
+                wsavc.connect(screenSharingServerUrl);
+                reconnected = true;
+                feedDog();
+            }
+            else {
+                console.log("ScreenShot WebSocket Connection Closed.");
+                alert("服务器中断或其他设备与服务器建立了新的连接，当前连接断开。\n尝试刷新页面重新建立连接。");
+            }
+        }
+    }
+    setInterval(onDog, 100);
+</script>
+
+</html>
