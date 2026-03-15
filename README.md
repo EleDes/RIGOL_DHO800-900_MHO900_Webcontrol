@@ -7,12 +7,14 @@
 
 ### For installation:
 
-Download [Webcontrol.apk](http://TODO)
+Download [Webcontrol.apk](https://github.com/EleDes/RIGOL_DHO800-900_MHO900_Webcontrol/releases/latest/download/Webcontrol.apk)
 
 You need ADB (Android Debug Bridge):
 * [Windows](https://dl.google.com/android/repository/platform-tools-latest-windows.zip)
 * [Linux](https://dl.google.com/android/repository/platform-tools-latest-linux.zip)
 * [Mac](https://dl.google.com/android/repository/platform-tools-latest-darwin.zip)
+
+Connect Scope to the network
 
 ### On a command line:
 
