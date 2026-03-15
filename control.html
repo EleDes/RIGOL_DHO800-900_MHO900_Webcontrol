@@ -1,319 +1,788 @@
-<!--
-  ~ 普源精电科技股份有限公司 版权所有(2019-2025)
-  -->
-
 <!DOCTYPE html>
-<html lang="zh-CN">
-
+<html lang="en" translate="no" class="notranslate">
 <head>
     <meta charset="utf-8">
-    <title></title>
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="google" content="notranslate">
+    <meta http-equiv="Content-Language" content="en">
+    <title>Rigol DHO Web Control</title>
     <style>
+        html,
         body {
+            width: 100%;
+            height: 100%;
             margin: 0;
-            padding: 0;
+            overflow: hidden;
+            background: #000;
+        }
+
+        body {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            user-select: none;
+            -webkit-user-select: none;
+            touch-action: none;
+        }
+
+        #pic {
+            display: block;
+            background: #000;
+            cursor: default;
+            touch-action: none;
+        }
+
+        #startup-hint {
+            position: fixed;
+            left: 50%;
+            top: 50%;
+            transform: translate(-50%, -50%);
+            z-index: 9999;
+            max-width: min(90vw, 44rem);
+            padding: 0.75rem 1rem;
+            border-radius: 0.75rem;
+            background: rgba(0, 0, 0, 0.78);
+            color: #fff;
+            font: 600 14px/1.4 Arial, Helvetica, sans-serif;
             text-align: center;
+            pointer-events: none;
+            opacity: 0;
+            transition: opacity 180ms ease;
         }
 
-        table {
-            border: 0;
-        }
-
-        #screenshot,
-        #screenRecord {
-            background-color: #555555;
-            border: none;
-            color: white;
-            padding: 12px 32px;
-            text-align: center;
-            text-decoration: none;
-            display: inline-block;
-            font-size: 14px;
-            border-radius: 4px;
-        }
-
-        #screenshot {
-            margin-left: 12px;
-        }
-
-        #screenRecord {
-            margin-left: 12px;
+        #startup-hint.is-visible {
+            opacity: 1;
         }
     </style>
     <script src="./res/config.js"></script>
-    <script type="text/javascript" src="./res/http-live-player.js">;</script>
+    <script src="./res/http-live-player.js"></script>
+</head>
+<body>
+    <canvas id="pic"></canvas>
+    <div id="startup-hint" aria-live="polite"></div>
+
     <script>
-        // 图片原始宽高
-        let originalWidth;
-        let originalHeight;
+        // Fixed logical resolution of the Rigol instrument display.
+        const BASE_WIDTH = 1024;
+        const BASE_HEIGHT = 600;
 
-        // 缩放比例
-        let scale = 1;
+        // Persist only the last useful popup bounds from normal windowed mode.
+        const WINDOW_STATE_STORAGE_KEY = "rigol-dho-control.window-state.v1";
+        const FULLSCREEN_STATE_STORAGE_KEY = "rigol-dho-control.fullscreen-state.v1";
 
-        window.onresize = function () {
-            console.log("window.onresize[window.innerWidth:" + window.innerWidth + ", window.innerHeight:"
-                + window.innerHeight + "]");
-            //setPictureSize();
+        const BOUNDS_POLL_INTERVAL_MS = 400;
+        const PROGRAMMATIC_CHANGE_SUPPRESSION_MS = 1800;
+        const RESTORE_RETRY_DELAYS_MS = [0, 80, 220, 600, 1200];
+        const STARTUP_HINT_DURATION_MS = 5000;
+        const FULLSCREEN_EXIT_PERSIST_DELAY_MS = 160;
+        const FULLSCREEN_DBLCLICK_GUARD_MS = 700;
+        const DOG_RESET_COUNT = 20;
+
+        const state = {
+            streamWidth: BASE_WIDTH,
+            streamHeight: BASE_HEIGHT,
+            inputScale: 1,
+            inputOffsetX: 0,
+            inputOffsetY: 0,
+            suppressPersistenceUntil: 0,
+            lastWindowStateSignature: "",
+            placementRetryHandles: [],
+            activePointerId: null,
+            pointerIsDown: false,
+            pointerDownTime: 0,
+            lastPointerPoint: null,
+            connectionAlertShown: false,
+            startupHintTimer: null,
+            fullscreenPreferred: false,
+            pendingFullscreenRestore: false,
+            fullscreenRequestInFlight: false,
+            fullscreenDisabledForSession: false,
+            lastFullscreenEntryAt: 0,
+            isPageUnloading: false,
+            dogCount: DOG_RESET_COUNT * 3,
+            reconnecting: false
         };
 
-        // window.onload = function () {
-        //     console.log("window.onload[" + (window.outerWidth - window.innerWidth) + ", " + (window.outerHeight - window.innerHeight))
-        //     setPictureSize();
-        // };
+        const displayCanvas = document.getElementById("pic");
+        const startupHint = document.getElementById("startup-hint");
+        const wsavc = new WSAvcPlayer(displayCanvas, "webgl", 1, 35);
+        const controlEvent = newWebSocket(controlEventServerUrl);
 
-        // 浏览器窗口大小改变、图片横竖切换、图片大小改变时，
-        // 重新设置html页面中pic节点的大小
-        function setPictureSize() {
-            const img = document.getElementById("pic");
-            // 初始化时，图片宽高为0，不进行处理
-            if (img.width === 0 || img.height === 0) {
+        function clamp(value, minValue, maxValue) {
+            return Math.max(minValue, Math.min(maxValue, value));
+        }
+
+        function getQueryParam(name) {
+            try {
+                return new URLSearchParams(window.location.search).get(name);
+            } catch (error) {
+                return null;
+            }
+        }
+
+        function readJsonFromStorage(storage, key, fallbackValue) {
+            try {
+                const rawValue = storage.getItem(key);
+                return rawValue ? JSON.parse(rawValue) : fallbackValue;
+            } catch (error) {
+                console.warn("Unable to read stored JSON value.", error);
+                return fallbackValue;
+            }
+        }
+
+        function writeJsonToStorage(storage, key, value) {
+            try {
+                storage.setItem(key, JSON.stringify(value));
+            } catch (error) {
+                console.warn("Unable to write stored JSON value.", error);
+            }
+        }
+
+        function isReloadNavigation() {
+            try {
+                const entries = performance.getEntriesByType("navigation");
+                if (entries && entries.length) {
+                    return entries[0].type === "reload";
+                }
+            } catch (error) {
+            }
+
+            try {
+                return performance.navigation && performance.navigation.type === 1;
+            } catch (error) {
+                return false;
+            }
+        }
+
+        function isFullscreenActive() {
+            return Boolean(document.fullscreenElement);
+        }
+
+        function canUseFullscreenMode() {
+            return Boolean(
+                !state.fullscreenDisabledForSession &&
+                document.fullscreenEnabled &&
+                document.documentElement &&
+                typeof document.documentElement.requestFullscreen === "function"
+            );
+        }
+
+        function readStoredFullscreenPreference() {
+            const savedState = readJsonFromStorage(localStorage, FULLSCREEN_STATE_STORAGE_KEY, null);
+            return Boolean(savedState && savedState.preferred);
+        }
+
+        function saveFullscreenPreference(isPreferred) {
+            state.fullscreenPreferred = Boolean(isPreferred);
+            writeJsonToStorage(localStorage, FULLSCREEN_STATE_STORAGE_KEY, {
+                preferred: state.fullscreenPreferred,
+                updatedAt: Date.now()
+            });
+        }
+
+        function getWindowChromeDelta() {
+            return {
+                width: Math.max(0, (window.outerWidth || 0) - (window.innerWidth || 0)),
+                height: Math.max(0, (window.outerHeight || 0) - (window.innerHeight || 0))
+            };
+        }
+
+        function getViewportSize() {
+            return {
+                width: Math.max(1, Math.round(window.innerWidth || BASE_WIDTH)),
+                height: Math.max(1, Math.round(window.innerHeight || BASE_HEIGHT))
+            };
+        }
+
+        function getWindowPosition() {
+            const x = Number.isFinite(window.screenX) ? window.screenX : (Number.isFinite(window.screenLeft) ? window.screenLeft : 0);
+            const y = Number.isFinite(window.screenY) ? window.screenY : (Number.isFinite(window.screenTop) ? window.screenTop : 0);
+            return {
+                x: Math.round(x),
+                y: Math.round(y)
+            };
+        }
+
+        function getCurrentWindowState() {
+            const viewport = getViewportSize();
+            const position = getWindowPosition();
+            return {
+                viewportWidth: viewport.width,
+                viewportHeight: viewport.height,
+                x: position.x,
+                y: position.y,
+                updatedAt: Date.now()
+            };
+        }
+
+        function makeWindowStateSignature(windowState) {
+            return [windowState.viewportWidth, windowState.viewportHeight, windowState.x, windowState.y].join("|");
+        }
+
+        function readStoredWindowState() {
+            const savedState = readJsonFromStorage(localStorage, WINDOW_STATE_STORAGE_KEY, null);
+            if (!savedState) {
+                return null;
+            }
+
+            const viewportWidth = Number.isFinite(savedState.viewportWidth) ? Math.max(200, Math.round(savedState.viewportWidth)) : null;
+            const viewportHeight = Number.isFinite(savedState.viewportHeight) ? Math.max(100, Math.round(savedState.viewportHeight)) : null;
+            const x = Number.isFinite(savedState.x) ? Math.round(savedState.x) : null;
+            const y = Number.isFinite(savedState.y) ? Math.round(savedState.y) : null;
+
+            if (!viewportWidth || !viewportHeight) {
+                return null;
+            }
+
+            return {
+                viewportWidth: viewportWidth,
+                viewportHeight: viewportHeight,
+                x: x,
+                y: y,
+                updatedAt: Number.isFinite(savedState.updatedAt) ? savedState.updatedAt : Date.now()
+            };
+        }
+
+        function saveWindowState(windowState) {
+            writeJsonToStorage(localStorage, WINDOW_STATE_STORAGE_KEY, windowState);
+        }
+
+        function suppressWindowStatePersistenceFor(durationMs) {
+            state.suppressPersistenceUntil = Math.max(state.suppressPersistenceUntil, Date.now() + durationMs);
+        }
+
+        function isWindowStatePersistenceSuppressed() {
+            return Date.now() < state.suppressPersistenceUntil;
+        }
+
+        // Persist window bounds only while not in fullscreen so the last normal popup
+        // size and position survive fullscreen sessions.
+        function persistCurrentWindowState(force) {
+            if (isFullscreenActive()) {
                 return;
             }
 
-            console.log("[original width:" + img.width + ",height:" + img.height
-                + "], [window width:" + window.innerWidth + ",height:" + window.innerHeight + "]");
+            if (!force && isWindowStatePersistenceSuppressed()) {
+                return;
+            }
 
-            if (originalWidth > originalHeight) {
-                // 横向的图片
-                img.height = originalHeight * window.innerWidth / originalWidth;
-                img.width = window.innerWidth;
-                // 如果图片高度超过浏览器高度，避免产生浏览器滑动，需要将图片进一步缩放
-                if (img.height > window.innerHeight) {
-                    img.width = originalWidth * window.innerHeight / originalHeight;
-                    img.height = window.innerHeight;
+            const windowState = getCurrentWindowState();
+            const signature = makeWindowStateSignature(windowState);
+            if (!force && signature === state.lastWindowStateSignature) {
+                return;
+            }
+
+            state.lastWindowStateSignature = signature;
+            saveWindowState(windowState);
+        }
+
+        function startWindowStatePolling() {
+            window.setInterval(function () {
+                persistCurrentWindowState(false);
+            }, BOUNDS_POLL_INTERVAL_MS);
+
+            function handlePageShutdown() {
+                state.isPageUnloading = true;
+                clearPlacementRetryHandles();
+                persistCurrentWindowState(true);
+                saveFullscreenPreference(state.fullscreenPreferred || isFullscreenActive());
+            }
+
+            window.addEventListener("pagehide", handlePageShutdown);
+            window.addEventListener("beforeunload", handlePageShutdown);
+        }
+
+        // Map the decoded video frame to the logical 1024x600 control surface.
+        function updateInputMapping(frameWidth, frameHeight) {
+            state.streamWidth = frameWidth || BASE_WIDTH;
+            state.streamHeight = frameHeight || BASE_HEIGHT;
+
+            const scaleX = state.streamWidth / BASE_WIDTH;
+            const scaleY = state.streamHeight / BASE_HEIGHT;
+            state.inputScale = Math.min(scaleX, scaleY) || 1;
+            state.inputOffsetX = (state.streamWidth - BASE_WIDTH * state.inputScale) / 2;
+            state.inputOffsetY = (state.streamHeight - BASE_HEIGHT * state.inputScale) / 2;
+        }
+
+        // Scale the visible display into the available browser viewport while keeping
+        // the instrument aspect ratio stable.
+        function updateCanvasLayout() {
+            const viewportWidth = Math.max(1, window.innerWidth || BASE_WIDTH);
+            const viewportHeight = Math.max(1, window.innerHeight || BASE_HEIGHT);
+            const fitScale = Math.min(viewportWidth / BASE_WIDTH, viewportHeight / BASE_HEIGHT);
+            const cssWidth = Math.max(1, Math.round(BASE_WIDTH * fitScale));
+            const cssHeight = Math.max(1, Math.round(BASE_HEIGHT * fitScale));
+
+            displayCanvas.style.width = cssWidth + "px";
+            displayCanvas.style.height = cssHeight + "px";
+        }
+
+        // Convert browser pointer coordinates back into logical Rigol coordinates.
+        function mapPointerToLogicalDisplay(evt, clampToBounds) {
+            const rect = displayCanvas.getBoundingClientRect();
+            if (!rect.width || !rect.height) {
+                return null;
+            }
+
+            const streamX = (evt.clientX - rect.left) * state.streamWidth / rect.width;
+            const streamY = (evt.clientY - rect.top) * state.streamHeight / rect.height;
+            let logicalX = (streamX - state.inputOffsetX) / state.inputScale;
+            let logicalY = (streamY - state.inputOffsetY) / state.inputScale;
+
+            if (clampToBounds) {
+                logicalX = clamp(logicalX, 0, BASE_WIDTH);
+                logicalY = clamp(logicalY, 0, BASE_HEIGHT);
+            } else if (logicalX < 0 || logicalX > BASE_WIDTH || logicalY < 0 || logicalY > BASE_HEIGHT) {
+                return null;
+            }
+
+            return {
+                x: Math.round(logicalX),
+                y: Math.round(logicalY)
+            };
+        }
+
+        function sendTouchEvent(eventType, x, y) {
+            if (!controlEvent || controlEvent.readyState !== WebSocket.OPEN) {
+                return;
+            }
+
+            controlEvent.send(JSON.stringify({
+                type: eventType,
+                downDelta: Date.now() - state.pointerDownTime,
+                clientX: x,
+                clientY: y
+            }));
+        }
+
+        function rememberPointerPoint(point) {
+            if (point) {
+                state.lastPointerPoint = point;
+            }
+        }
+
+        function showStartupHint(message) {
+            if (!message) {
+                return;
+            }
+
+            if (state.startupHintTimer) {
+                clearTimeout(state.startupHintTimer);
+            }
+
+            startupHint.textContent = message;
+            startupHint.classList.add("is-visible");
+            state.startupHintTimer = window.setTimeout(hideStartupHint, STARTUP_HINT_DURATION_MS);
+        }
+
+        function hideStartupHint() {
+            if (state.startupHintTimer) {
+                clearTimeout(state.startupHintTimer);
+                state.startupHintTimer = null;
+            }
+
+            startupHint.classList.remove("is-visible");
+            startupHint.textContent = "";
+        }
+
+        function updateStartupHint() {
+            if (!canUseFullscreenMode()) {
+                hideStartupHint();
+                return;
+            }
+
+            if (state.pendingFullscreenRestore) {
+                showStartupHint("Full screen was active last time. Tap or click once to restore it. Double-click toggles full screen.");
+                return;
+            }
+
+            showStartupHint("Double-click toggles full screen.");
+        }
+
+        function requestFullscreenForDisplay() {
+            if (!canUseFullscreenMode()) {
+                return Promise.resolve(false);
+            }
+
+            try {
+                return Promise.resolve(document.documentElement.requestFullscreen()).then(function () {
+                    return true;
+                }).catch(function (error) {
+                    console.warn("Unable to enter fullscreen mode.", error);
+                    return false;
+                });
+            } catch (error) {
+                console.warn("Unable to enter fullscreen mode.", error);
+                return Promise.resolve(false);
+            }
+        }
+
+        function exitFullscreenForDisplay() {
+            if (!isFullscreenActive()) {
+                return Promise.resolve(true);
+            }
+
+            try {
+                return Promise.resolve(document.exitFullscreen()).then(function () {
+                    return true;
+                }).catch(function (error) {
+                    console.warn("Unable to exit fullscreen mode.", error);
+                    return false;
+                });
+            } catch (error) {
+                console.warn("Unable to exit fullscreen mode.", error);
+                return Promise.resolve(false);
+            }
+        }
+
+        // Restore fullscreen on the first valid user interaction only when the browser
+        // exposes fullscreen support for this environment.
+        function triggerPendingFullscreenRestore() {
+            if (!state.pendingFullscreenRestore || isFullscreenActive() || state.fullscreenRequestInFlight || !canUseFullscreenMode()) {
+                return;
+            }
+
+            state.fullscreenRequestInFlight = true;
+            requestFullscreenForDisplay().then(function (enteredFullscreen) {
+                state.fullscreenRequestInFlight = false;
+
+                if (enteredFullscreen) {
+                    state.pendingFullscreenRestore = false;
+                    state.lastFullscreenEntryAt = Date.now();
+                    saveFullscreenPreference(true);
+                    hideStartupHint();
+                    updateCanvasLayout();
+                    return;
                 }
-            } else {
-                // 竖向的图片
-                img.width = originalWidth * window.innerHeight / originalHeight;
-                img.height = window.innerHeight;
-            }
-            // 计算缩放比例，如果picWidth不为0
-            if (originalWidth) {
-                scale = img.width / originalWidth;
-            }
 
-            console.log("setPictureSize[img.width:" + img.width + ",img.height:"
-                + img.height + ",scale:" + scale + "]");
+                state.fullscreenDisabledForSession = true;
+                hideStartupHint();
+            });
         }
 
-
-    </script>
-</head>
-
-<body>
-<canvas src="" id="pic" alt="" />
-</body>
-<script>
-    function sleep(delay) {
-        let endTime = new Date().getTime()+parseInt(delay);
-        while (new Date().getTime() < endTime );
-    }
-    /**
-    * 获取网页输入参数
-    */
-    function getParams(key) {
-        var reg = new RegExp("(^|&)" + key + "=([^&]*)(&|$)");
-        var r = window.location.search.substr(1).match(reg);
-        if (r != null) {
-            return unescape(r[2]);
-        }
-        return null;
-    };
-
-    /**
-    * 缩放参数 用于输入点击事件
-    */
-    let scale_w = 1;
-    let scale_h = 1;
-    let offset_w = 0;
-    let offset_h = 0;
-
-    /**
-    * 建立wsavc解码界面
-    */
-    var displayCanvas = document.getElementById("pic");
-    var wsavc = new WSAvcPlayer(displayCanvas, "webgl", 1, 35);
-
-
-    const dogRstCnt = 20;
-    var dogCnt = dogRstCnt*3;
-    var reconnected = false;
-
-    function feedDog() {
-        dogCnt = dogRstCnt;
-    }
-
-
-
-
-    wsavc.setSocketMessageCallback(function () {
-        reconnected = false;
-        feedDog();
-    });
-
-    /**
-    * 设置wsavc获取图像参数后的回调，设置窗口大小
-    */
-    wsavc.setSizeChangedCallback(function (w, h) {
-        try {
-
-            var width = w;
-            var height = h;
-            let deltaWidth = window.outerWidth - window.innerWidth;
-            let deltaHeight = window.outerHeight - window.innerHeight;
-
-            scale_w = w / 1024;
-            scale_h = h / 600;
-            if (scale_w < scale_h) {
-                offset_h = (height - 600.0 * width / 1024) / 2 ;
-                offset_w = 0;
-                scale_h = scale_w;
-            }
-            else {
-                offset_w = (width - 1024.0 * height / 600) / 2 ;
-                offset_h = 0;
-                scale_w = scale_h;
+        function toggleFullscreenMode() {
+            if (isFullscreenActive()) {
+                exitFullscreenForDisplay();
+                return;
             }
 
+            requestFullscreenForDisplay().then(function (enteredFullscreen) {
+                if (!enteredFullscreen) {
+                    state.fullscreenDisabledForSession = true;
+                    hideStartupHint();
+                    return;
+                }
 
-            window.resizeTo(width + deltaWidth, height + deltaHeight);
-        } catch (e) {
-            console.error(e)
+                state.pendingFullscreenRestore = false;
+                state.lastFullscreenEntryAt = Date.now();
+                saveFullscreenPreference(true);
+                hideStartupHint();
+            });
         }
 
-    }
-    );
+        function handleFullscreenChange() {
+            updateCanvasLayout();
 
-    /**
-    * webSocket连接时设置编码参数，编码参数地址栏获取
-    */
-    wsavc.setSocketConnectCallback(function () {
-        var message = { "type": "SET_ENCODER", "size": getParams("size"), "rate": getParams("rate") };
-        this.ws.send(JSON.stringify(message));
-        console.log("Sent " + JSON.stringify(message));
-    }
-    );
-    /**
-     * Input WebSocket Connection
-     */
-    const controlEvent = newWebSocket(controlEventServerUrl);
+            if (isFullscreenActive()) {
+                state.pendingFullscreenRestore = false;
+                state.lastFullscreenEntryAt = Date.now();
+                saveFullscreenPreference(true);
+                hideStartupHint();
+                return;
+            }
 
-    /**
-    * webSocket连接断开提示
-    */
-     wsavc.setSocketClosedCallback(function () {
-         //console.log("ScreenShot WebSocket Connection Closed.");
-         //alert("服务器中断或其他设备与服务器建立了新的连接，当前连接断开。\n尝试刷新页面重新建立连接。");
-         sleep(2);
-         if (controlEvent.readyState == WebSocket.OPEN && reconnected == false) {
-            console.log("ws state:" + wsavc.ws.readyState);
-            //wsavc.disconnect();
-            wsavc.connect(screenSharingServerUrl);
-            reconnected = true;
-            feedDog();
+            if (state.isPageUnloading) {
+                return;
+            }
+
+            saveFullscreenPreference(false);
+            window.setTimeout(function () {
+                persistCurrentWindowState(true);
+            }, FULLSCREEN_EXIT_PERSIST_DELAY_MS);
         }
-     }
-     );
-    wsavc.connect(screenSharingServerUrl);
-    window.wsavc = wsavc;
 
+        function maybeRestoreFullscreenOnPointerDown(evt) {
+            if (evt.pointerType === "touch" || evt.pointerType === "pen") {
+                return;
+            }
+            triggerPendingFullscreenRestore();
+        }
 
+        function maybeRestoreFullscreenOnPointerUp(evt) {
+            if (evt.pointerType === "touch" || evt.pointerType === "pen") {
+                triggerPendingFullscreenRestore();
+            }
+        }
 
-    /**
-     * Input WebSocket Connection
-     */
-    //const controlEvent = newWebSocket(controlEventServerUrl);
-    // 鼠标事件
-    let isDown;
-    let nowTime;
-    document.getElementById("pic").onmousedown = function (evt) {
-        console.log("onmousedown, evt: " + evt.button)
-        // 响应鼠标左键
-        if (evt.button === 0) {
+        function handlePointerDown(evt) {
+            if (!evt.isPrimary) {
+                return;
+            }
+
+            maybeRestoreFullscreenOnPointerDown(evt);
+
+            const point = mapPointerToLogicalDisplay(evt, false);
+            if (!point) {
+                return;
+            }
+
             evt.preventDefault();
-            isDown = true;
-            nowTime = Date.now();
-            const e = event || window.event;
-            const img = document.getElementById("pic");
-            if (e.offsetX > offset_w && e.offsetX < img.width - offset_w && e.offsetY > offset_h && e.offsetY < img.height - offset_h) {
-                sendTouchEvent("onmousedown", (e.offsetX - offset_w) / scale_w, (e.offsetY - offset_h) / scale_h);
-            }
-        }
-    };
-    document.getElementById("pic").onmousemove = function (evt) {
-        console.log("onmousemove, evt: " + evt.button)
-        // 响应鼠标左键
-        if (evt.button === 0) {
-            const e = event || window.event;
-            if (isDown) {
-                const img = document.getElementById("pic");
-                if (e.offsetX > offset_w && e.offsetX < img.width - offset_w && e.offsetY > offset_h && e.offsetY < img.height - offset_h) {
-                    sendTouchEvent("onmousemove", (e.offsetX - offset_w) / scale_w, (e.offsetY - offset_h) / scale_h);
+            state.activePointerId = evt.pointerId;
+            state.pointerIsDown = true;
+            state.pointerDownTime = Date.now();
+            rememberPointerPoint(point);
+
+            if (typeof displayCanvas.setPointerCapture === "function") {
+                try {
+                    displayCanvas.setPointerCapture(evt.pointerId);
+                } catch (error) {
                 }
             }
+
+            sendTouchEvent("onmousedown", point.x, point.y);
         }
-    };
-    document.getElementById("pic").onmouseup = function (evt) {
-        console.log("onmouseup, evt: " + evt.button)
-        // 响应鼠标左键
-        if (evt.button === 0) {
-            isDown = false;
-            const e = event || window.event;
-            const img = document.getElementById("pic");
-            if (e.offsetX > offset_w && e.offsetX < img.width - offset_w && e.offsetY > offset_h && e.offsetY < img.height - offset_h) {
-                sendTouchEvent("onmouseup", (e.offsetX - offset_w) / scale_w, (e.offsetY - offset_h) / scale_h);
+
+        function handlePointerMove(evt) {
+            if (!state.pointerIsDown || evt.pointerId !== state.activePointerId) {
+                return;
+            }
+
+            const point = mapPointerToLogicalDisplay(evt, true);
+            if (!point) {
+                return;
+            }
+
+            evt.preventDefault();
+            rememberPointerPoint(point);
+            sendTouchEvent("onmousemove", point.x, point.y);
+        }
+
+        function finishPointerInteraction(evt, eventType) {
+            if (!state.pointerIsDown) {
+                return;
+            }
+
+            if (evt && evt.pointerId !== state.activePointerId) {
+                return;
+            }
+
+            let point = evt ? mapPointerToLogicalDisplay(evt, true) : null;
+            if (!point) {
+                point = state.lastPointerPoint;
+            }
+
+            if (evt) {
+                evt.preventDefault();
+            }
+
+            if (point) {
+                sendTouchEvent(eventType, point.x, point.y);
+            }
+
+            state.pointerIsDown = false;
+            state.activePointerId = null;
+        }
+
+        function setupPointerHandlers() {
+            displayCanvas.addEventListener("pointerdown", handlePointerDown);
+            displayCanvas.addEventListener("pointermove", handlePointerMove);
+            displayCanvas.addEventListener("pointerup", function (evt) {
+                maybeRestoreFullscreenOnPointerUp(evt);
+                finishPointerInteraction(evt, "onmouseup");
+            });
+            displayCanvas.addEventListener("pointercancel", function (evt) {
+                finishPointerInteraction(evt, "onmouseup");
+            });
+            displayCanvas.addEventListener("pointerleave", function (evt) {
+                finishPointerInteraction(evt, "onmouseup");
+            });
+            displayCanvas.addEventListener("dblclick", function (evt) {
+                evt.preventDefault();
+                if (Date.now() - state.lastFullscreenEntryAt < FULLSCREEN_DBLCLICK_GUARD_MS) {
+                    return;
+                }
+                toggleFullscreenMode();
+            });
+        }
+
+        function clearPlacementRetryHandles() {
+            for (const handle of state.placementRetryHandles) {
+                clearTimeout(handle);
+            }
+            state.placementRetryHandles = [];
+        }
+
+        function resizeWindowToViewport(viewportWidth, viewportHeight) {
+            if (typeof window.resizeTo !== "function") {
+                return;
+            }
+
+            const chrome = getWindowChromeDelta();
+            const outerWidth = Math.max(200, Math.round(viewportWidth + chrome.width));
+            const outerHeight = Math.max(100, Math.round(viewportHeight + chrome.height));
+
+            try {
+                window.resizeTo(outerWidth, outerHeight);
+            } catch (error) {
+                console.warn("Unable to resize popup window.", error);
             }
         }
-    };
-    document.getElementById("pic").onmouseleave = function (evt) {
-        console.log("onmouseleave, evt: " + evt.button + " " + isDown);
-        // 响应鼠标左键
-        const e = event || window.event;
-        if (isDown) {
-            isDown = false;
-            const img = document.getElementById("pic");
-            console.log("" + (e.offsetX - offset_w) / scale_w + "" + (e.offsetY - offset_h) / scale_h);
-            sendTouchEvent("onmouseup", (e.offsetX - offset_w) / scale_w, (e.offsetY - offset_h) / scale_h);
+
+        function moveWindowTo(targetX, targetY) {
+            if (typeof window.moveTo !== "function") {
+                return;
+            }
+            if (!Number.isFinite(targetX) || !Number.isFinite(targetY)) {
+                return;
+            }
+
+            try {
+                window.moveTo(Math.round(targetX), Math.round(targetY));
+            } catch (error) {
+                console.warn("Unable to move popup window.", error);
+            }
         }
-    };
 
-    // 发送鼠标消息
-    function sendTouchEvent(eventType, x, y) {
-        const obj = {
-            type: eventType,
-            downDelta: Date.now - nowTime,
-            clientX: x,
-            clientY: y
-        };
-        if (controlEvent.readyState === WebSocket.OPEN) {
-            controlEvent.send(JSON.stringify(obj));
-            console.log("sendTouchEvent[" + eventType + ":" + x / scale + "," + y / scale + "]");
+        function schedulePlacementRestore(viewportWidth, viewportHeight, targetX, targetY) {
+            clearPlacementRetryHandles();
+            suppressWindowStatePersistenceFor(
+                PROGRAMMATIC_CHANGE_SUPPRESSION_MS + RESTORE_RETRY_DELAYS_MS[RESTORE_RETRY_DELAYS_MS.length - 1]
+            );
+
+            for (const delay of RESTORE_RETRY_DELAYS_MS) {
+                const handle = window.setTimeout(function () {
+                    resizeWindowToViewport(viewportWidth, viewportHeight);
+                    moveWindowTo(targetX, targetY);
+                }, delay);
+                state.placementRetryHandles.push(handle);
+            }
+
+            const finalizeHandle = window.setTimeout(function () {
+                updateCanvasLayout();
+                persistCurrentWindowState(true);
+                clearPlacementRetryHandles();
+            }, RESTORE_RETRY_DELAYS_MS[RESTORE_RETRY_DELAYS_MS.length - 1] + 300);
+            state.placementRetryHandles.push(finalizeHandle);
         }
-    }
 
+        function restoreInitialWindowPlacement() {
+            const savedState = readStoredWindowState();
+            const viewportWidth = savedState ? savedState.viewportWidth : BASE_WIDTH;
+            const viewportHeight = savedState ? savedState.viewportHeight : BASE_HEIGHT;
+            const currentPosition = getWindowPosition();
+            const targetX = savedState && Number.isFinite(savedState.x) ? savedState.x : currentPosition.x;
+            const targetY = savedState && Number.isFinite(savedState.y) ? savedState.y : currentPosition.y;
 
-    /**
-     * 看门狗启动
-     */
-    function onDog() {
-        dogCnt--;
-        console.log("dog cnt:" + dogCnt);
-        if (dogCnt <= 0) //2s timeout to reconnect
-        {
-            if (reconnected == false) {
-                console.log("ws state:" + wsavc.ws.readyState);
-                wsavc.disconnect();
-                wsavc.connect(screenSharingServerUrl);
-                reconnected = true;
+            if (isReloadNavigation()) {
+                state.lastWindowStateSignature = makeWindowStateSignature(getCurrentWindowState());
+                updateCanvasLayout();
+                return;
+            }
+
+            schedulePlacementRestore(viewportWidth, viewportHeight, targetX, targetY);
+        }
+
+        function feedDog() {
+            state.dogCount = DOG_RESET_COUNT;
+        }
+
+        function showConnectionClosedAlertOnce() {
+            if (state.connectionAlertShown) {
+                return;
+            }
+
+            state.connectionAlertShown = true;
+            alert("The connection was interrupted, or another client connected to the instrument. This session has been closed.\nTry refreshing the page to reconnect.");
+        }
+
+        function reconnectStream() {
+            if (state.reconnecting) {
+                return;
+            }
+
+            state.reconnecting = true;
+            window.setTimeout(function () {
+                try {
+                    wsavc.connect(screenSharingServerUrl);
+                } catch (error) {
+                    console.warn("Unable to reconnect the video stream.", error);
+                }
                 feedDog();
-            }
-            else {
-                console.log("ScreenShot WebSocket Connection Closed.");
-                alert("服务器中断或其他设备与服务器建立了新的连接，当前连接断开。\n尝试刷新页面重新建立连接。");
-            }
+            }, 25);
         }
-    }
-    setInterval(onDog, 100);
-</script>
 
+        wsavc.setSocketMessageCallback(function () {
+            state.reconnecting = false;
+            state.connectionAlertShown = false;
+            feedDog();
+        });
+
+        wsavc.setSizeChangedCallback(function (width, height) {
+            try {
+                displayCanvas.width = width;
+                displayCanvas.height = height;
+                updateInputMapping(width, height);
+                updateCanvasLayout();
+            } catch (error) {
+                console.error(error);
+            }
+        });
+
+        wsavc.setSocketConnectCallback(function () {
+            const message = {
+                type: "SET_ENCODER",
+                size: getQueryParam("size"),
+                rate: getQueryParam("rate")
+            };
+            this.ws.send(JSON.stringify(message));
+        });
+
+        wsavc.setSocketClosedCallback(function () {
+            if (controlEvent.readyState === WebSocket.OPEN && !state.reconnecting) {
+                reconnectStream();
+            }
+        });
+
+        function onDog() {
+            state.dogCount -= 1;
+            if (state.dogCount > 0) {
+                return;
+            }
+
+            if (!state.reconnecting) {
+                try {
+                    wsavc.disconnect();
+                } catch (error) {
+                }
+                reconnectStream();
+                return;
+            }
+
+            showConnectionClosedAlertOnce();
+        }
+
+        function initializeApplication() {
+            state.fullscreenPreferred = readStoredFullscreenPreference();
+            state.pendingFullscreenRestore = state.fullscreenPreferred && canUseFullscreenMode();
+
+            updateInputMapping(BASE_WIDTH, BASE_HEIGHT);
+            updateCanvasLayout();
+            setupPointerHandlers();
+            startWindowStatePolling();
+            restoreInitialWindowPlacement();
+
+            window.addEventListener("resize", updateCanvasLayout);
+            document.addEventListener("fullscreenchange", handleFullscreenChange);
+
+            updateStartupHint();
+
+            wsavc.connect(screenSharingServerUrl);
+            window.wsavc = wsavc;
+            window.controlEvent = controlEvent;
+            window.setInterval(onDog, 100);
+        }
+
+        window.addEventListener("load", initializeApplication, { once: true });
+    </script>
+</body>
 </html>
