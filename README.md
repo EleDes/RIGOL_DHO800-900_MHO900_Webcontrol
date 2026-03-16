@@ -12,8 +12,8 @@ Download [Webcontrol.apk](https://github.com/EleDes/RIGOL_DHO800-900_MHO900_Webc
 
 You need ADB (Android Debug Bridge):
 * [Windows](https://dl.google.com/android/repository/platform-tools-latest-windows.zip)
-* [Linux](https://dl.google.com/android/repository/platform-tools-latest-linux.zip)
-* [Mac](https://dl.google.com/android/repository/platform-tools-latest-darwin.zip)
+* [Linux](https://dl.google.com/android/repository/platform-tools-latest-linux.zip) or on Debian/Ubuntu/Pi OS/derivates: ```sudo apt install adb```  
+* [Mac](https://dl.google.com/android/repository/platform-tools-latest-darwin.zip) or ```brew install --cask android-platform-tools```  
 
 Connect Scope to the network
 
