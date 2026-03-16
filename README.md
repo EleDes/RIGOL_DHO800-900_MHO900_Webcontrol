@@ -37,4 +37,7 @@ Click button "Web Control"
 adb connect [Scope IP address or network name]:55555  
 #### install original Webcontrol.apk:
 adb install -r [path to backup directory]Webcontrol_backup.apk  
-adb shell monkey -p com.rigol.webcontrol 1
+adb shell monkey -p com.rigol.webcontrol 1  
+
+### Restore original Webcontrol.apk without backup:
+[install firmware update](https://www.rigolna.com/firmware/), it will overwrite Webcontrol.apk  
