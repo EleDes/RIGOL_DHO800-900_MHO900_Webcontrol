@@ -24,13 +24,13 @@ adb connect [Scope IP address or network name]:55555
 #### make backup of Webcontrol.apk:
 adb pull /data/app/com.rigol.webcontrol-2/base.apk [path to backup directory]Webcontrol_backup.apk 
 #### install new Webcontrol.apk:
-adb install -r [path to webcontrol.apk]Webcontrol.apk
-adb shell monkey -p com.rigol.webcontrol 1
+adb install -r [path to webcontrol.apk]Webcontrol.apk  
+adb shell monkey -p com.rigol.webcontrol 1  
 
 
 ### In your browser:
 http://[Scope IP address or network name]  
-Click button "Web Control"
+Click button "Web Control"  
 
 
 ### To restore original Webcontrol.apk:
