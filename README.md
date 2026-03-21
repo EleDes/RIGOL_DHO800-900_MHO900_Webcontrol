@@ -5,10 +5,10 @@
 * Remembers the last position & size
 * Fullscreen with double click
 
-
 ### For installation:
 
-Download [Webcontrol.apk](https://github.com/EleDes/RIGOL_DHO800-900_MHO900_Webcontrol/releases/latest/download/Webcontrol.apk)
+Download [Webcontrol.apk](https://github.com/EleDes/RIGOL_DHO800-900_MHO900_Webcontrol/releases/latest/download/Webcontrol.apk) (this is the latest version, all versions are available in [Releases](https://github.com/EleDes/RIGOL_DHO800-900_MHO900_Webcontrol/releases))  
+Details in the [Release description](https://github.com/EleDes/RIGOL_DHO800-900_MHO900_Webcontrol/releases/latest/)  
 
 You need ADB (Android Debug Bridge):
 * [Windows](https://dl.google.com/android/repository/platform-tools-latest-windows.zip)
