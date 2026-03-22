@@ -2,7 +2,7 @@
 
 ### A modified Webcontrol that has the features that it is supposed to have:
 * Resizeable
-* Remembers the last position & size
+* Remembers the last window state
 * Fullscreen with double click
 
 ### For installation:
